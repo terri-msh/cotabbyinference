@@ -485,8 +485,7 @@ struct CotabbyInferenceEngine::Impl {
     };
 
     // Recovered Cotypist confidence/depth formula. Only the deepest matching context contributes;
-    // a single learned continuation gets a full gate, while ambiguous branches are attenuated by
-    // the gap between their two strongest adjustments.
+    // confidence is the gap between the two strongest adjustments (top2 is zero for one branch).
     PersonalizationApplication applyPersonalization(
         int logits_row,
         const std::vector<llama_token>& history) {
@@ -516,8 +515,9 @@ struct CotabbyInferenceEngine::Impl {
         if (!matched) return application;
 
         float gate = 1.0f;
-        if (matched->size() > 1 && personalization_branch_threshold >= 0.0f) {
-            const float gap = (*matched)[0].value - (*matched)[1].value;
+        if (personalization_branch_threshold >= 0.0f) {
+            const float top2 = matched->size() > 1 ? (*matched)[1].value : 0.0f;
+            const float gap = (*matched)[0].value - top2;
             const float exponent = -personalization_steepness
                 * (gap - personalization_branch_threshold);
             gate = 1.0f / (std::exp(exponent) + 1.0f);
