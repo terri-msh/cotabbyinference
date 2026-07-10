@@ -1,6 +1,7 @@
 #include "CotabbyInferenceEngine.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -109,6 +110,9 @@ struct SequenceState {
     int kv_position_count = 0;
     std::atomic<bool> cancelled{false};
     std::string last_piece;
+    // Prompt plus already sampled tokens. The personalization trie reads the suffix of this vector
+    // before every sample, independently of the sampler's own repetition-penalty history.
+    std::vector<llama_token> token_history;
 
     llama_token seed_token = 0;
     bool has_seed_token = false;
@@ -130,6 +134,9 @@ struct SequenceState {
     // argmax-is-EOG verdict for the seed token's logits row, captured at decodePrompt while
     // those logits are still resident; the row is gone by the time sampleNext returns the seed.
     bool seed_argmax_is_eog = false;
+    int seed_personalization_match_depth = 0;
+    int seed_personalization_adjustment_count = 0;
+    float seed_personalization_scale = 0.0f;
 
     ~SequenceState() {
         if (sampler) { llama_sampler_free(sampler); }
@@ -143,6 +150,7 @@ struct SequenceState {
           kv_position_count(o.kv_position_count),
           cancelled(o.cancelled.load()),
           last_piece(std::move(o.last_piece)),
+          token_history(std::move(o.token_history)),
           seed_token(o.seed_token),
           has_seed_token(o.has_seed_token),
           pending_input_token(o.pending_input_token),
@@ -150,7 +158,10 @@ struct SequenceState {
           force_word_continuation(o.force_word_continuation),
           compute_logprob(o.compute_logprob),
           seed_logprob(o.seed_logprob),
-          seed_argmax_is_eog(o.seed_argmax_is_eog) {
+          seed_argmax_is_eog(o.seed_argmax_is_eog),
+          seed_personalization_match_depth(o.seed_personalization_match_depth),
+          seed_personalization_adjustment_count(o.seed_personalization_adjustment_count),
+          seed_personalization_scale(o.seed_personalization_scale) {
         o.sampler = nullptr;
     }
     SequenceState& operator=(SequenceState&&) = delete;
@@ -174,6 +185,7 @@ struct PendingRequest {
     llama_sampler* sampler = nullptr;
     std::atomic<bool>* cancelled_ptr = nullptr;
     std::string* piece_buffer = nullptr;
+    std::vector<llama_token>* token_history = nullptr;
     SampleResult* result_out = nullptr;
     // Snapshot of the sequence's compute_logprob flag at staging time, so the decoder thread
     // never has to re-resolve the sequence entry.
@@ -231,6 +243,43 @@ struct CotabbyInferenceEngine::Impl {
     // the control/unknown/unused attributes. Surfaced via getMaskedScaffoldingTokenCount so
     // tests and diagnostics can confirm the rule's reach on a given vocabulary.
     int scaffolding_masked_count = 0;
+
+    static constexpr int MAX_PERSONALIZATION_ORDER = 5;
+    struct NGramKey {
+        std::array<llama_token, MAX_PERSONALIZATION_ORDER> tokens{};
+        uint8_t length = 0;
+
+        bool operator==(const NGramKey& other) const {
+            if (length != other.length) return false;
+            for (uint8_t i = 0; i < length; ++i) {
+                if (tokens[i] != other.tokens[i]) return false;
+            }
+            return true;
+        }
+    };
+    struct NGramKeyHash {
+        size_t operator()(const NGramKey& key) const {
+            size_t hash = static_cast<size_t>(key.length) + 0x9e3779b9;
+            for (uint8_t i = 0; i < key.length; ++i) {
+                hash ^= static_cast<size_t>(static_cast<uint32_t>(key.tokens[i]))
+                    + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+            }
+            return hash;
+        }
+    };
+    struct PersonalizationAdjustment {
+        llama_token token = 0;
+        float value = 0.0f;
+    };
+
+    mutable std::mutex personalization_mutex;
+    std::unordered_map<NGramKey, std::vector<PersonalizationAdjustment>, NGramKeyHash>
+        personalization_profile;
+    int personalization_max_order = MAX_PERSONALIZATION_ORDER;
+    float personalization_strength = 0.0f;
+    float personalization_branch_threshold = 2.0f;
+    float personalization_steepness = 1.0f;
+    float personalization_depth_growth = 0.5f;
 
     // Public-facing sequence map (external int32_t IDs → state) and the
     // internal `llama_seq_id` slot allocator.
@@ -419,6 +468,75 @@ struct CotabbyInferenceEngine::Impl {
         }
     }
 
+    NGramKey historyKey(const std::vector<llama_token>& history, int depth) const {
+        NGramKey key;
+        key.length = static_cast<uint8_t>(depth);
+        const size_t start = history.size() - static_cast<size_t>(depth);
+        for (int i = 0; i < depth; ++i) {
+            key.tokens[static_cast<size_t>(i)] = history[start + static_cast<size_t>(i)];
+        }
+        return key;
+    }
+
+    struct PersonalizationApplication {
+        int match_depth = 0;
+        int adjustment_count = 0;
+        float scale = 0.0f;
+    };
+
+    // Recovered Cotypist confidence/depth formula. Only the deepest matching context contributes;
+    // a single learned continuation gets a full gate, while ambiguous branches are attenuated by
+    // the gap between their two strongest adjustments.
+    PersonalizationApplication applyPersonalization(
+        int logits_row,
+        const std::vector<llama_token>& history) {
+        PersonalizationApplication application;
+        if (!shared_ctx || !vocab || history.empty()) return application;
+        float* logits = llama_get_logits_ith(shared_ctx, logits_row);
+        if (!logits) return application;
+
+        std::lock_guard<std::mutex> lock(personalization_mutex);
+        if (personalization_strength <= 0.0f || personalization_profile.empty()) return application;
+
+        const int depth_limit = std::min({
+            personalization_max_order,
+            MAX_PERSONALIZATION_ORDER,
+            static_cast<int>(history.size())
+        });
+        const std::vector<PersonalizationAdjustment>* matched = nullptr;
+        int matched_depth = 0;
+        for (int depth = depth_limit; depth >= 1; --depth) {
+            auto found = personalization_profile.find(historyKey(history, depth));
+            if (found != personalization_profile.end() && !found->second.empty()) {
+                matched = &found->second;
+                matched_depth = depth;
+                break;
+            }
+        }
+        if (!matched) return application;
+
+        float gate = 1.0f;
+        if (matched->size() > 1 && personalization_branch_threshold >= 0.0f) {
+            const float gap = (*matched)[0].value - (*matched)[1].value;
+            const float exponent = -personalization_steepness
+                * (gap - personalization_branch_threshold);
+            gate = 1.0f / (std::exp(exponent) + 1.0f);
+        }
+        const float depth_multiplier = 1.0f
+            + personalization_depth_growth * static_cast<float>(matched_depth - 1);
+        const float scale = personalization_strength * gate * depth_multiplier;
+        application.match_depth = matched_depth;
+        application.adjustment_count = static_cast<int>(matched->size());
+        application.scale = scale;
+        const int32_t vocab_size = llama_vocab_n_tokens(vocab);
+        for (const auto& adjustment : *matched) {
+            if (adjustment.token >= 0 && adjustment.token < vocab_size) {
+                logits[adjustment.token] += scale * adjustment.value;
+            }
+        }
+        return application;
+    }
+
     // Log-probability of `token` under the raw model distribution at `logits_row`, used as a
     // confidence signal. Two O(vocab) passes; only invoked on the autocomplete path.
     float computeLogprob(int logits_row, llama_token token) const {
@@ -571,6 +689,13 @@ struct CotabbyInferenceEngine::Impl {
                        req.cancelled_ptr->load(std::memory_order_acquire)) {
                 r.was_cancelled = true;
             } else {
+                PersonalizationApplication personalization;
+                if (req.token_history) {
+                    personalization = applyPersonalization(i, *req.token_history);
+                }
+                r.personalization_match_depth = personalization.match_depth;
+                r.personalization_adjustment_count = personalization.adjustment_count;
+                r.personalization_scale = personalization.scale;
                 llama_token next = llama_sampler_sample(
                     req.sampler, shared_ctx, i
                 );
@@ -584,6 +709,9 @@ struct CotabbyInferenceEngine::Impl {
                     r.is_eos = true;
                 } else {
                     llama_sampler_accept(req.sampler, next);
+                    if (req.token_history) {
+                        req.token_history->push_back(next);
+                    }
 
                     std::string& piece = *req.piece_buffer;
                     piece.resize(64);
@@ -729,6 +857,7 @@ void CotabbyInferenceEngine::unloadModel() {
     }
     impl_->vocab = nullptr;
     impl_->model_path.clear();
+    clearPersonalizationProfile();
 
     if (impl_->backend_initialized) {
         llama_backend_free();
@@ -847,6 +976,129 @@ std::vector<int32_t> CotabbyInferenceEngine::tokenizeWithOptions(
         }
         capacity = std::max(capacity * 2, -n);
     }
+}
+
+void CotabbyInferenceEngine::rebuildPersonalizationProfile(
+    const int32_t* tokens,
+    int token_count,
+    const int32_t* document_lengths,
+    int document_count,
+    int max_order) {
+    using Key = Impl::NGramKey;
+    using KeyHash = Impl::NGramKeyHash;
+    using BranchCounts = std::unordered_map<llama_token, int>;
+
+    if (!impl_ || !impl_->vocab || !tokens || token_count <= 0
+        || !document_lengths || document_count <= 0) {
+        clearPersonalizationProfile();
+        return;
+    }
+
+    const int order = std::max(1, std::min(max_order, Impl::MAX_PERSONALIZATION_ORDER));
+    const int32_t vocab_size = llama_vocab_n_tokens(impl_->vocab);
+    std::vector<int> global_counts(static_cast<size_t>(std::max(vocab_size, 0)), 0);
+    std::unordered_map<Key, BranchCounts, KeyHash> counts;
+    size_t valid_token_count = 0;
+    int cursor = 0;
+
+    for (int document = 0; document < document_count && cursor < token_count; ++document) {
+        const int requested_length = std::max(0, document_lengths[document]);
+        const int length = std::min(requested_length, token_count - cursor);
+        if (length <= 0) continue;
+
+        for (int position = 0; position < length; ++position) {
+            const llama_token next = tokens[cursor + position];
+            if (next < 0 || next >= vocab_size) continue;
+            global_counts[static_cast<size_t>(next)]++;
+            valid_token_count++;
+
+            const int depth_limit = std::min(order, position);
+            for (int depth = 1; depth <= depth_limit; ++depth) {
+                Key key;
+                key.length = static_cast<uint8_t>(depth);
+                const int context_start = cursor + position - depth;
+                for (int index = 0; index < depth; ++index) {
+                    key.tokens[static_cast<size_t>(index)] = tokens[context_start + index];
+                }
+                counts[key][next]++;
+            }
+        }
+        cursor += length;
+    }
+
+    size_t observed_vocabulary = 0;
+    for (const int count : global_counts) {
+        if (count > 0) observed_vocabulary++;
+    }
+    observed_vocabulary = std::max<size_t>(observed_vocabulary, 1);
+
+    std::unordered_map<Key, std::vector<Impl::PersonalizationAdjustment>, KeyHash> profile;
+    profile.reserve(counts.size());
+    for (const auto& [key, branches] : counts) {
+        int context_total = 0;
+        for (const auto& [token, count] : branches) {
+            (void) token;
+            context_total += count;
+        }
+        if (context_total < 2) continue;
+
+        std::vector<Impl::PersonalizationAdjustment> adjustments;
+        adjustments.reserve(branches.size());
+        for (const auto& [token, count] : branches) {
+            // One-offs make a profile memorize accidental text and secrets. Cotypist's serialized
+            // profile likewise keeps learned adjustments, not every observed edge.
+            if (count < 2 || token < 0 || token >= vocab_size) continue;
+            const double conditional = (static_cast<double>(count) + 0.5)
+                / (static_cast<double>(context_total) + 0.5 * branches.size());
+            const double baseline = (static_cast<double>(global_counts[static_cast<size_t>(token)]) + 0.5)
+                / (static_cast<double>(valid_token_count) + 0.5 * observed_vocabulary);
+            const double lift = std::log(std::max(conditional / baseline, 1.0));
+            const float adjustment = static_cast<float>(std::min(lift, 8.0));
+            if (adjustment > 0.0f) {
+                adjustments.push_back({ token, adjustment });
+            }
+        }
+        std::sort(adjustments.begin(), adjustments.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.value == rhs.value) return lhs.token < rhs.token;
+            return lhs.value > rhs.value;
+        });
+        if (adjustments.size() > 16) adjustments.resize(16);
+        if (!adjustments.empty()) profile.emplace(key, std::move(adjustments));
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->personalization_mutex);
+    impl_->personalization_profile = std::move(profile);
+    impl_->personalization_max_order = order;
+}
+
+void CotabbyInferenceEngine::clearPersonalizationProfile() {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->personalization_mutex);
+    impl_->personalization_profile.clear();
+}
+
+void CotabbyInferenceEngine::configurePersonalization(
+    float strength,
+    float branch_threshold,
+    float steepness,
+    float depth_growth) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->personalization_mutex);
+    impl_->personalization_strength = std::max(0.0f, strength);
+    impl_->personalization_branch_threshold = branch_threshold;
+    impl_->personalization_steepness = std::max(0.0f, steepness);
+    impl_->personalization_depth_growth = std::max(0.0f, depth_growth);
+}
+
+int CotabbyInferenceEngine::getPersonalizationEntryCount() const {
+    if (!impl_) return 0;
+    std::lock_guard<std::mutex> lock(impl_->personalization_mutex);
+    size_t count = 0;
+    for (const auto& [key, adjustments] : impl_->personalization_profile) {
+        (void) key;
+        count += adjustments.size();
+    }
+    return static_cast<int>(std::min<size_t>(count, static_cast<size_t>(INT32_MAX)));
 }
 
 bool CotabbyInferenceEngine::hasChatTemplate() const {
@@ -986,6 +1238,16 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
 
     llama_batch_free(batch);
     seq->kv_position_count = total_end_position;
+    if (start_position <= 0) {
+        seq->token_history.assign(tokens, tokens + token_count);
+    } else {
+        const size_t keep = std::min(
+            static_cast<size_t>(start_position),
+            seq->token_history.size()
+        );
+        seq->token_history.resize(keep);
+        seq->token_history.insert(seq->token_history.end(), tokens, tokens + token_count);
+    }
 
     // First-token word-continuation constraint: when the caret is mid-word, mask new-word-start
     // tokens for this seed only so the completion continues the current word instead of starting
@@ -995,15 +1257,21 @@ EngineStatus CotabbyInferenceEngine::decodePrompt(int32_t sequence_id,
         seq->force_word_continuation = false;
     }
 
+    const auto seed_personalization = impl_->applyPersonalization(-1, seq->token_history);
+
     // Seed sample: take one token from the prompt's logits row right now,
     // before any other sequence's decode can overwrite the shared logits
     // buffer. The seed will be returned by the next sampleNext call as-is
     // and feedback-decoded by the call after that.
     llama_token seed = llama_sampler_sample(seq->sampler, impl_->shared_ctx, -1);
     llama_sampler_accept(seq->sampler, seed);
+    seq->token_history.push_back(seed);
     seq->seed_token = seed;
     seq->seed_logprob = seq->compute_logprob ? impl_->computeLogprob(-1, seed) : 0.0f;
     seq->seed_argmax_is_eog = impl_->argmaxIsEOG(-1);
+    seq->seed_personalization_match_depth = seed_personalization.match_depth;
+    seq->seed_personalization_adjustment_count = seed_personalization.adjustment_count;
+    seq->seed_personalization_scale = seed_personalization.scale;
     seq->has_seed_token = true;
     seq->has_pending_input = false;
 
@@ -1049,6 +1317,9 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
         llama_token next = seq->seed_token;
         seq->has_seed_token = false;
         result.argmax_is_eog = seq->seed_argmax_is_eog;
+        result.personalization_match_depth = seq->seed_personalization_match_depth;
+        result.personalization_adjustment_count = seq->seed_personalization_adjustment_count;
+        result.personalization_scale = seq->seed_personalization_scale;
 
         if (next == llama_vocab_eos(impl_->vocab) ||
             llama_vocab_is_eog(impl_->vocab, next)) {
@@ -1097,6 +1368,7 @@ SampleResult CotabbyInferenceEngine::sampleNext(int32_t sequence_id) {
     req.sampler = seq->sampler;
     req.cancelled_ptr = &seq->cancelled;
     req.piece_buffer = &seq->last_piece;
+    req.token_history = &seq->token_history;
     req.result_out = &result;
     req.compute_logprob = seq->compute_logprob;
     auto done_future = req.done.get_future();
@@ -1206,6 +1478,8 @@ EngineStatus CotabbyInferenceEngine::acceptToken(int32_t sequence_id, int32_t to
     }
 
     seq->kv_position_count++;
+    seq->token_history.push_back(token);
+    impl_->applyPersonalization(-1, seq->token_history);
     return EngineStatus::ok;
 }
 
@@ -1239,6 +1513,10 @@ bool CotabbyInferenceEngine::trimKV(int32_t sequence_id, int keep_positions) {
         // before the next sampleNext.
         seq->has_seed_token = false;
         seq->has_pending_input = false;
+        if (keep_positions >= 0
+            && static_cast<size_t>(keep_positions) < seq->token_history.size()) {
+            seq->token_history.resize(static_cast<size_t>(keep_positions));
+        }
     }
     return ok;
 }
@@ -1301,6 +1579,7 @@ bool CotabbyInferenceEngine::restoreSequence(int32_t sequence_id, const uint8_t*
     // re-prime via decodePrompt before the next sampleNext.
     seq->has_seed_token = false;
     seq->has_pending_input = false;
+    seq->token_history.clear();
     return true;
 }
 

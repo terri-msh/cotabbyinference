@@ -33,6 +33,10 @@ struct SWIFT_SELF_CONTAINED SampleResult {
     // step it appears, even when the sampled token is something else. Appended after the
     // existing fields so Swift call sites that only read members keep compiling.
     bool argmax_is_eog;
+    // Content-free personalization diagnostics for causal quality analysis.
+    int personalization_match_depth;
+    int personalization_adjustment_count;
+    float personalization_scale;
 };
 
 enum class EngineStatus : int {
@@ -75,6 +79,18 @@ public:
                                              bool add_special,
                                              bool parse_special) const;
     int detokenize(int32_t token, char* buffer, int buffer_size) const;
+
+    // Local personalization profile. `tokens` contains all tokenized documents back-to-back and
+    // `document_lengths` supplies their boundaries so n-grams never bridge unrelated inputs.
+    // The profile stores only positive, repeated continuations and is applied directly to logits
+    // before the existing sampler chain runs.
+    void rebuildPersonalizationProfile(const int32_t* tokens, int token_count,
+                                       const int32_t* document_lengths, int document_count,
+                                       int max_order);
+    void clearPersonalizationProfile();
+    void configurePersonalization(float strength, float branch_threshold,
+                                  float steepness, float depth_growth);
+    int getPersonalizationEntryCount() const;
 
     // Chat templates
     //

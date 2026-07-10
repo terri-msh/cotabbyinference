@@ -85,6 +85,14 @@ final class LlamaMiddlewareTests: XCTestCase {
         XCTAssertEqual(engine.getContextWindowTokens(), 0)
         XCTAssertEqual(engine.getBatchSize(), 0)
         XCTAssertEqual(engine.getGPULayerCount(), 0)
+        XCTAssertEqual(engine.getPersonalizationEntryCount(), 0)
+    }
+
+    func testPersonalizationConfigurationWithoutModelIsSafe() {
+        var engine = CotabbyInferenceEngine()
+        engine.configurePersonalization(0.08, 3, 0.5, 0.75)
+        engine.clearPersonalizationProfile()
+        XCTAssertEqual(engine.getPersonalizationEntryCount(), 0)
     }
 
     func testDecodePromptWithoutModelReturnsNotLoaded() {
@@ -118,6 +126,40 @@ final class LlamaMiddlewareTests: XCTestCase {
         let prompt = "The quick brown fox"
         let tokens = engine.tokenize(prompt, Int32(prompt.utf8.count))
         XCTAssertFalse(tokens.isEmpty)
+
+        // Build a repeated local-writing profile whose suffix matches the generation prompt.
+        // Document lengths are passed separately so no learned edge crosses record boundaries.
+        let profileDocuments = Array(repeating: "The quick brown fox leaps over obstacles.", count: 3)
+        var profileTokens: [Int32] = []
+        var profileLengths: [Int32] = []
+        for document in profileDocuments {
+            let tokenVector = engine.tokenizeWithOptions(
+                document,
+                Int32(document.utf8.count),
+                false,
+                false
+            )
+            var documentTokens: [Int32] = []
+            documentTokens.reserveCapacity(Int(tokenVector.size()))
+            for index in 0..<Int(tokenVector.size()) {
+                documentTokens.append(tokenVector[index])
+            }
+            profileTokens.append(contentsOf: documentTokens)
+            profileLengths.append(Int32(documentTokens.count))
+        }
+        engine.configurePersonalization(0.08, 3, 0.5, 0.75)
+        profileTokens.withUnsafeBufferPointer { tokensBuffer in
+            profileLengths.withUnsafeBufferPointer { lengthsBuffer in
+                engine.rebuildPersonalizationProfile(
+                    tokensBuffer.baseAddress,
+                    Int32(tokensBuffer.count),
+                    lengthsBuffer.baseAddress,
+                    Int32(lengthsBuffer.count),
+                    5
+                )
+            }
+        }
+        XCTAssertGreaterThan(engine.getPersonalizationEntryCount(), 0)
 
         // Chat-template path: instruct models ship a template; if present,
         // rendering a simple conversation must produce a non-empty prompt that
@@ -175,10 +217,13 @@ final class LlamaMiddlewareTests: XCTestCase {
 
         // Sample a few tokens
         var generated = ""
+        var observedPersonalizationMatch = false
         for _ in 0..<4 {
             let result = engine.sampleNext(seqA)
             if result.is_eos { break }
             XCTAssertFalse(result.was_cancelled)
+            observedPersonalizationMatch = observedPersonalizationMatch
+                || result.personalization_match_depth > 0
             if let piece = result.piece, result.piece_length > 0 {
                 generated += String(
                     bytes: UnsafeBufferPointer(
@@ -191,6 +236,7 @@ final class LlamaMiddlewareTests: XCTestCase {
             }
         }
         XCTAssertFalse(generated.isEmpty, "Expected at least one generated token")
+        XCTAssertTrue(observedPersonalizationMatch, "Expected the repeated prompt suffix to match the profile")
 
         // Trim KV back to prompt (remove sampled tokens)
         let trimOk = engine.trimKV(seqA, Int32(tokenArray.count))
@@ -219,6 +265,9 @@ final class LlamaMiddlewareTests: XCTestCase {
         // Destroy both
         engine.destroySequence(seqB)
         engine.destroySequence(seqA)
+
+        engine.clearPersonalizationProfile()
+        XCTAssertEqual(engine.getPersonalizationEntryCount(), 0)
 
         // Double-destroy is safe
         engine.destroySequence(seqA)
