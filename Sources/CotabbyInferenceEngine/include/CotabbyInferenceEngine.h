@@ -182,6 +182,15 @@ public:
     size_t snapshotSequence(int32_t sequence_id, uint8_t* dst, size_t capacity);
     bool restoreSequence(int32_t sequence_id, const uint8_t* src, size_t size, int position_count);
 
+    // Hybrid/recurrent prompt reuse. Partial checkpoints contain the memory that ordinary
+    // sequence removal cannot roll back. Restore it before removing the cache suffix, then reset
+    // the sampler so tokens from the previous completion cannot affect the next one.
+    size_t partialCheckpointSize(int32_t sequence_id) const;
+    size_t savePartialCheckpoint(int32_t sequence_id, uint8_t* dst, size_t capacity);
+    bool restorePartialCheckpoint(int32_t sequence_id, const uint8_t* src,
+                                  size_t size, int position_count);
+    bool resetSequenceSampler(int32_t sequence_id, int position_count);
+
     // Cancellation (thread-safe, non-blocking)
     void cancelSequence(int32_t sequence_id);
 

@@ -125,6 +125,8 @@ BenchResult run_baseline_b_shared_context(
     // sequence's prompt logits are still resident. The next prompt decode for
     // sequence s+1 overwrites the logits buffer, so we must sample-before-
     // advance. The sampled token becomes the seed input to the timed loop.
+    Timer prompt_timer;
+    prompt_timer.start();
     for (int s = 0; s < cfg.num_sequences; ++s) {
         if (!decode_prompt_for_seq(
                 ctx, static_cast<llama_seq_id>(s),
@@ -139,6 +141,7 @@ BenchResult run_baseline_b_shared_context(
         last_tokens[s] = llama_sampler_sample(samplers[s], ctx, -1);
         llama_sampler_accept(samplers[s], last_tokens[s]);
     }
+    r.prompt_decode_seconds = prompt_timer.elapsed_seconds();
 
     // Timed: build one batch carrying num_sequences tokens (different seq_ids),
     // decode all of them in a single llama_decode call, then sample one new

@@ -1583,6 +1583,73 @@ bool CotabbyInferenceEngine::restoreSequence(int32_t sequence_id, const uint8_t*
     return true;
 }
 
+size_t CotabbyInferenceEngine::partialCheckpointSize(int32_t sequence_id) const {
+    if (!impl_ || !impl_->shared_ctx) return 0;
+    const SequenceState* seq = impl_->findSequence(sequence_id);
+    if (!seq) return 0;
+    return llama_state_seq_get_size_ext(
+        impl_->shared_ctx, seq->seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+}
+
+size_t CotabbyInferenceEngine::savePartialCheckpoint(
+    int32_t sequence_id, uint8_t* dst, size_t capacity) {
+    if (!impl_ || !impl_->shared_ctx || !dst) return 0;
+    SequenceState* seq = impl_->findSequence(sequence_id);
+    if (!seq) return 0;
+    std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+    return llama_state_seq_get_data_ext(
+        impl_->shared_ctx, dst, capacity, seq->seq_id,
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+}
+
+bool CotabbyInferenceEngine::restorePartialCheckpoint(
+    int32_t sequence_id, const uint8_t* src, size_t size, int position_count) {
+    if (!impl_ || !impl_->shared_ctx || !src) return false;
+    SequenceState* seq = impl_->findSequence(sequence_id);
+    if (!seq) return false;
+
+    std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+    const size_t read = llama_state_seq_set_data_ext(
+        impl_->shared_ctx, src, size, seq->seq_id,
+        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    if (read == 0) return false;
+
+    // llama.cpp's server uses this order for hybrid/SWA rollback: restore the parts that cannot
+    // be removed, then discard the ordinary cache suffix. seq_rm may report false because the
+    // recurrent memory itself is not removable; that part has already been restored above.
+    llama_memory_t memory = llama_get_memory(impl_->shared_ctx);
+    if (!memory) return false;
+    llama_memory_seq_rm(memory, seq->seq_id, static_cast<llama_pos>(position_count), -1);
+
+    seq->kv_position_count = position_count;
+    seq->has_seed_token = false;
+    seq->has_pending_input = false;
+    seq->last_piece.clear();
+    if (seq->sampler) llama_sampler_reset(seq->sampler);
+    if (position_count >= 0
+        && static_cast<size_t>(position_count) < seq->token_history.size()) {
+        seq->token_history.resize(static_cast<size_t>(position_count));
+    }
+    return true;
+}
+
+bool CotabbyInferenceEngine::resetSequenceSampler(int32_t sequence_id, int position_count) {
+    if (!impl_) return false;
+    SequenceState* seq = impl_->findSequence(sequence_id);
+    if (!seq || !seq->sampler) return false;
+    std::lock_guard<std::mutex> lock(impl_->decode_mutex);
+    llama_sampler_reset(seq->sampler);
+    seq->kv_position_count = position_count;
+    seq->has_seed_token = false;
+    seq->has_pending_input = false;
+    seq->last_piece.clear();
+    if (position_count >= 0
+        && static_cast<size_t>(position_count) < seq->token_history.size()) {
+        seq->token_history.resize(static_cast<size_t>(position_count));
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Cancellation
 // ---------------------------------------------------------------------------

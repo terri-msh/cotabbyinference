@@ -56,6 +56,7 @@ void print_result(const BenchResult& r) {
         "\"num_sequences\":%d,"
         "\"prompt_tokens\":%d,"
         "\"sample_tokens\":%d,"
+        "\"prompt_decode_seconds\":%.4f,"
         "\"elapsed_seconds\":%.4f,"
         "\"total_tokens_sampled\":%d,"
         "\"aggregate_tokens_per_second\":%.2f,"
@@ -65,6 +66,7 @@ void print_result(const BenchResult& r) {
         r.num_sequences,
         r.prompt_tokens,
         r.sample_tokens,
+        r.prompt_decode_seconds,
         r.elapsed_seconds,
         r.total_tokens_sampled,
         r.aggregate_tokens_per_second,

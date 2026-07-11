@@ -34,6 +34,7 @@ struct BenchResult {
     int num_sequences = 0;
     int prompt_tokens = 0;
     int sample_tokens = 0;
+    double prompt_decode_seconds = 0.0;
     double elapsed_seconds = 0.0;
     int total_tokens_sampled = 0;
     double aggregate_tokens_per_second = 0.0;
